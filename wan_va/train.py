@@ -50,18 +50,25 @@ import gc
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
-            self.wandb = wandb
-            self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
-                # dir=log_dir,
+            wandb_kwargs = dict(
+                project=os.getenv("WANDB_PROJECT", "lingbot-va"),
                 config=config,
                 mode="online",
-                name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
+                name=os.getenv("WANDB_RUN_NAME", "lingbot-va-train"),
             )
+            entity = os.getenv("WANDB_TEAM_NAME") or os.getenv("WANDB_ENTITY")
+            if entity:
+                wandb_kwargs["entity"] = entity
+            if os.getenv("WANDB_API_KEY"):
+                login_kwargs = {"key": os.environ["WANDB_API_KEY"]}
+                if os.getenv("WANDB_BASE_URL"):
+                    login_kwargs["host"] = os.environ["WANDB_BASE_URL"]
+                wandb.login(**login_kwargs)
+            self.wandb = wandb
+            self.wandb.init(**wandb_kwargs)
             logger.info("WandB logging enabled")
+        else:
+            self.wandb = None
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -127,12 +134,22 @@ class Trainer:
             shuffle=True,
             seed=42
         ) if config.world_size > 1 else None
+        # Prefer file_system sharing: some container hosts reject AF_UNIX bind
+        # used by FD sharing (OSError 95) when num_workers > 0.
+        try:
+            torch.multiprocessing.set_sharing_strategy("file_system")
+        except RuntimeError:
+            pass
+        num_workers = int(getattr(config, "load_worker", 0) or 0)
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
-            shuffle=(train_sampler is None), 
-            num_workers=config.load_worker,
+            shuffle=(train_sampler is None),
+            num_workers=num_workers,
             sampler=train_sampler,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+            pin_memory=False,
         )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -243,7 +260,13 @@ class Trainer:
             'latent_dict': latent_dict,
             'action_dict': action_dict,
             'chunk_size': torch.randint(1, 5, (1,)).item(),
-            'window_size': torch.randint(4, 65, (1,)).item(),
+            'window_size': (
+                torch.randint(
+                    int(getattr(self.config, "train_window_size_range", (4, 65))[0]),
+                    int(getattr(self.config, "train_window_size_range", (4, 65))[1]),
+                    (1,),
+                ).item()
+            ),
         }
         return input_dict
 
@@ -519,10 +542,29 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.learning_rate is not None:
+        config.learning_rate = args.learning_rate
+    if args.num_steps is not None:
+        config.num_steps = args.num_steps
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    if args.gradient_accumulation_steps is not None:
+        config.gradient_accumulation_steps = args.gradient_accumulation_steps
+    if args.save_interval is not None:
+        config.save_interval = args.save_interval
+    if args.load_worker is not None:
+        config.load_worker = args.load_worker
+    if args.resume_from is not None:
+        config.resume_from = args.resume_from
+    if args.enable_wandb:
+        config.enable_wandb = True
+    if args.disable_wandb:
+        config.enable_wandb = False
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
+        logger.info(f"save_root={config.save_root} enable_wandb={config.enable_wandb}")
 
     trainer = Trainer(config)
     trainer.train()
@@ -543,6 +585,15 @@ def main():
         default=None,
         help="Root directory for saving checkpoints",
     )
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--num-steps", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
+    parser.add_argument("--save-interval", type=int, default=None)
+    parser.add_argument("--load-worker", type=int, default=None)
+    parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--enable-wandb", action="store_true")
+    parser.add_argument("--disable-wandb", action="store_true")
 
     args = parser.parse_args()
     run(args)

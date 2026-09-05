@@ -1,39 +1,37 @@
-#!/usr/bin/bash
-
-set -x
+#!/usr/bin/env bash
+# Distributed launcher for LingBot-VA post-training.
+# Prefer calling via ../train.sh (sets caches / wandb / HF).
+# Direct use:
+#   NGPU=2 CONFIG_NAME=uniarm_train bash script/run_va_posttrain.sh
+set -euo pipefail
 
 umask 007
- 
-NGPU=${NGPU:-"8"}
-MASTER_PORT=${MASTER_PORT:-"29501"}
-PORT=${PORT:-"1106"}
-LOG_RANK=${LOG_RANK:-"0"}
-TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
-CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"} # robotwin_train, libero_train
 
-overrides=""
-if [ $# -ne 0 ]; then
-    overrides="$*"
+NGPU="${NGPU:-2}"
+MASTER_PORT="${MASTER_PORT:-29501}"
+LOG_RANK="${LOG_RANK:-0}"
+TORCHFT_LIGHTHOUSE="${TORCHFT_LIGHTHOUSE:-http://localhost:29510}"
+CONFIG_NAME="${CONFIG_NAME:-uniarm_train}"
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT}"
+
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export TORCHFT_LIGHTHOUSE
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+echo "[run_va_posttrain] NGPU=${NGPU} CONFIG_NAME=${CONFIG_NAME} MASTER_PORT=${MASTER_PORT}"
+
+# Allow either: bash run_va_posttrain.sh  OR  bash run_va_posttrain.sh --config-name ...
+if [[ " $* " != *" --config-name "* ]]; then
+  set -- --config-name "${CONFIG_NAME}" "$@"
 fi
+echo "[run_va_posttrain] args: $*"
 
-export WANDB_API_KEY="your key"
-export WANDB_BASE_URL="your url"
-export WANDB_TEAM_NAME="your team name"
-export WANDB_PROJECT="your project"
-
-## node setting
-num_gpu=${NGPU}
-master_port=${MASTER_PORT}
-log_rank=${LOG_RANK}
-torchft_lighthouse=${TORCHFT_LIGHTHOUSE}
-config_name=${CONFIG_NAME}
-
-## cmd setting
-export TOKENIZERS_PARALLELISM=false
-PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
 python -m torch.distributed.run \
-    --nproc_per_node=${num_gpu} \
-    --local-ranks-filter=${log_rank} \
-    --master_port ${master_port} \
-    --tee 3 \
-    -m wan_va.train --config-name ${config_name} $overrides
+  --nproc_per_node="${NGPU}" \
+  --local-ranks-filter="${LOG_RANK}" \
+  --master_port "${MASTER_PORT}" \
+  --tee 3 \
+  -m wan_va.train \
+  "$@"

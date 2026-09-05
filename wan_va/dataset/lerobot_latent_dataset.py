@@ -7,8 +7,6 @@ from pathlib import Path
 from collections.abc import Callable
 import os
 from tqdm import tqdm
-from multiprocessing import Pool
-from functools import partial
 import torch
 from einops import rearrange
 from torch.utils.data import DataLoader
@@ -40,17 +38,24 @@ def construct_lerobot(
 def construct_lerobot_multi_processor(config, 
                                       num_init_worker=8,
                                       ):
-    datasets_out_lst = []
-    construct_func = partial(
-        construct_lerobot,
-        config=config,
-    )
+    """Build datasets in-process.
+
+    Avoid multiprocessing.Pool: LatentLeRobotDataset is not reliably picklable
+    when returning across processes (OSError 95 / MaybeEncodingError on some
+    shared filesystems). Use threads for parallel I/O when there are many repos.
+    """
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    with Pool(num_init_worker) as pool:
-        datasets_out_lst = pool.map(construct_func, repo_list)
-                
-    return datasets_out_lst
+    if not repo_list:
+        return []
+
+    if len(repo_list) == 1 or num_init_worker <= 1:
+        return [construct_lerobot(repo_id, config) for repo_id in repo_list]
+
+    from concurrent.futures import ThreadPoolExecutor
+    workers = min(num_init_worker, len(repo_list))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(lambda rid: construct_lerobot(rid, config), repo_list))
 
 def get_relative_pose(pose):
     if torch.is_tensor(pose):
@@ -255,17 +260,26 @@ class LatentLeRobotDataset(LeRobotDataset):
     
     def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
         act_shift = int(latent_frame_ids[0] - local_start_frame)
-        frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
+        frame_stride = int(latent_frame_ids[1] - latent_frame_ids[0]) if len(latent_frame_ids) > 1 else 1
+        # Prefer explicit config; fallback to structural stride*4 (Wan temporal = 4).
+        action_per_frame = int(getattr(self.config, "action_per_frame", frame_stride * 4))
         action = action[act_shift:]
         if self.config.env_type == 'robotwin_tshape': ## TODO support get_relative_pose for other dataset, currently only support robotwin 
             left_action = get_relative_pose(action[:, :7])
             right_action = get_relative_pose(action[:, 8:15])
             action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
-        action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
+        action = np.pad(action, pad_width=((action_per_frame, 0), (0, 0)), mode='constant', constant_values=0)
 
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
-        required_action_num = latent_frame_num * frame_stride * 4
+        required_action_num = latent_frame_num * action_per_frame
 
+        if action.shape[0] < required_action_num:
+            action = np.pad(
+                action,
+                pad_width=((0, required_action_num - action.shape[0]), (0, 0)),
+                mode='constant',
+                constant_values=0,
+            )
         action = action[:required_action_num]
         action_mask = np.ones_like(action, dtype='bool')
         assert action.shape[0] == required_action_num
@@ -283,6 +297,35 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_aligned *= action_mask_aligned
         return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
+
+    def _maybe_crop_train_window(self, latents, actions, actions_mask):
+        """Crop/pad along latent time to a fixed train_max_latent_frames.
+
+        Fixed length is required for batch_size>1 (default_collate).
+        """
+        max_f = int(getattr(self.config, "train_max_latent_frames", 0) or 0)
+        if max_f <= 0:
+            return latents, actions, actions_mask
+        # latents: [F,H,W,C], actions: [C,F,N,1]
+        f = latents.shape[0]
+        if f > max_f:
+            start = int(torch.randint(0, f - max_f + 1, (1,)).item())
+            end = start + max_f
+            latents = latents[start:end]
+            actions = actions[:, start:end]
+            actions_mask = actions_mask[:, start:end]
+        elif f < max_f:
+            pad_f = max_f - f
+            latents = torch.nn.functional.pad(latents, (0, 0, 0, 0, 0, 0, 0, pad_f))
+            actions = torch.nn.functional.pad(actions, (0, 0, 0, 0, 0, pad_f))
+            actions_mask = torch.nn.functional.pad(
+                actions_mask, (0, 0, 0, 0, 0, pad_f), value=False)
+        # Detach from non-resizable / shared storage so DataLoader collate works.
+        return (
+            latents.contiguous().clone(),
+            actions.contiguous().clone(),
+            actions_mask.contiguous().clone(),
+        )
 
     def __getitem__(self, idx) -> dict:
         idx = idx % len(self.new_metas)
@@ -304,8 +347,14 @@ class LatentLeRobotDataset(LeRobotDataset):
         out_dict = self._cat_video_latents(ori_data_dict)
 
         out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
+        out_dict['latents'], out_dict['actions'], out_dict['actions_mask'] = self._maybe_crop_train_window(
+            out_dict['latents'], out_dict['actions'], out_dict['actions_mask']
+        )
 
-        out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
+        out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2).contiguous().clone()
+        # text_emb may come from shared empty_emb / mmap; clone for collate.
+        if torch.is_tensor(out_dict['text_emb']):
+            out_dict['text_emb'] = out_dict['text_emb'].contiguous().clone()
         return out_dict
 
     def __len__(self):

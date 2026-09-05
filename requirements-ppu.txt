@@ -1,0 +1,18 @@
+# PPU setup companion for requirements.txt — no torch / flash-attn pins.
+# Those come from the PAI-PPU image (or --upgrade-torch).
+diffusers==0.36.0
+transformers==4.55.2
+accelerate
+einops
+easydict
+peft>=0.17.0
+numpy==1.26.4
+tqdm
+imageio[ffmpeg]
+websockets
+msgpack
+opencv-python
+matplotlib
+ftfy
+safetensors
+Pillow

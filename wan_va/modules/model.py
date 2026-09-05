@@ -25,6 +25,7 @@ from torch.nn.attention.flex_attention import (
     or_masks
 )
 from functools import partial
+import os
 
 try:
     from flash_attn_interface import flash_attn_func
@@ -34,16 +35,67 @@ except:
 __all__ = ['WanTransformer3DModel']
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_ppu_device() -> bool:
+    try:
+        if not torch.cuda.is_available():
+            return False
+        name = torch.cuda.get_device_name(0).upper()
+        return ("PPU" in name) or ("ZW810" in name)
+    except Exception:
+        return False
+
+
+def _should_compile_flex() -> bool:
+    """Whether to torch.compile flex_attention / create_block_mask.
+
+    On PPU, inductor cannot lower flex_attention_backward (NoValidChoicesError),
+    so compile defaults OFF there. Eager flex_attention still provides the same
+    masked attention used by training. Override with LINGBOT_COMPILE_FLEX=1.
+    """
+    return _env_flag("LINGBOT_COMPILE_FLEX", not _is_ppu_device())
+
+
+def _flex_compile_backend() -> str:
+    """Inductor flex backward is broken on PPU; aot_eager keeps AOT but eager kernels."""
+    return os.environ.get("LINGBOT_FLEX_COMPILE_BACKEND", "inductor").strip() or "inductor"
+
+
+def _flex_compile_dynamic() -> bool:
+    """dynamic=True + kernel_options triggers PPU inductor NameError(s10)."""
+    return _env_flag("LINGBOT_FLEX_DYNAMIC", not _is_ppu_device())
+
+
+def _build_flex_attn() -> Callable:
+    if not _should_compile_flex():
+        return flex_attention
+    backend = _flex_compile_backend()
+    dynamic = _flex_compile_dynamic()
+    if backend == "inductor":
+        return torch.compile(flex_attention, dynamic=dynamic)
+    return torch.compile(flex_attention, backend=backend, dynamic=dynamic)
+
+
+def _build_create_block_mask() -> Callable:
+    if not _should_compile_flex():
+        return create_block_mask
+    return torch.compile(create_block_mask)
+
+
 def custom_sdpa(q, k, v):
     out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
                                          v.transpose(1, 2))
     return out.transpose(1, 2)
 
 class FlexAttnFunc(nn.Module):
-    flex_attn: ClassVar[Callable] = torch.compile(
-        flex_attention, dynamic=True, 
-    )
-    compiled_create_block_mask: ClassVar[Callable] = torch.compile(create_block_mask)
+    flex_attn: ClassVar[Callable] = _build_flex_attn()
+    compiled_create_block_mask: ClassVar[Callable] = _build_create_block_mask()
     attention_mask: ClassVar[BlockMask] = None
     cross_attention_mask: ClassVar[BlockMask] = None
 
@@ -127,16 +179,17 @@ class FlexAttnFunc(nn.Module):
         frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
         noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
 
+        compile_mask = _should_compile_flex()
         mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size)
         block_mask = FlexAttnFunc.compiled_create_block_mask(
-                mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True
+                mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=compile_mask
             )
         FlexAttnFunc.attention_mask = block_mask
 
         text_seq_ids = torch.arange(B)[:, None].expand(-1, 512).flatten()
         mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids.long().to(device), text_seq_ids.long().to(device))
         block_mask_cross = FlexAttnFunc.compiled_create_block_mask(
-                mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True
+                mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=compile_mask
             )
         FlexAttnFunc.cross_attention_mask = block_mask_cross
     
