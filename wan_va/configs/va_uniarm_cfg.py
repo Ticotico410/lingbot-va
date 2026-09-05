@@ -7,10 +7,17 @@ from .shared_config import va_shared_cfg
 va_uniarm_cfg = EasyDict(__name__='Config: VA uniarm')
 va_uniarm_cfg.update(va_shared_cfg)
 va_uniarm_cfg.infer_mode = 'server'
+# 单卡 24GB：VAE + UMT5 放到 CPU，只把 transformer 留在 GPU（官方 README 推荐）
+va_uniarm_cfg.enable_offload = True
 
 va_uniarm_cfg.wan22_pretrained_model_name_or_path = (
-    '/mnt/workspace/users/wanganran_2T/ckpt/lingbot-va-base')
+    '/home/karthus_chen/ycb_ws/model/lingbot-va-base')
 
+# Optional: used when client does not send negative_prompt_embeds.
+va_uniarm_cfg.empty_emb_path = (
+    '/home/karthus_chen/unitree_sh_disk/tools/ycb/datasets/uniarml1/'
+    'pick_key_and_controller_335/lerobot_v2.1/empty_emb.pt'
+)
 va_uniarm_cfg.attn_window = 30
 va_uniarm_cfg.frame_chunk_size = 4
 va_uniarm_cfg.env_type = 'none'

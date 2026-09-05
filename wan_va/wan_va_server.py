@@ -103,6 +103,9 @@ class VA_Server:
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
 
+        # Used by server-mode video decode (and i2va generate()).
+        self.video_processor = VideoProcessor(vae_scale_factor=1)
+
     def _get_t5_prompt_embeds(
         self,
         prompt=None,
@@ -322,12 +325,62 @@ class VA_Server:
                                                           action_mask] *= 0
         return input_dict
 
+    def _streaming_vae_cache_is_cold(self) -> bool:
+        return all(c is None for c in self.streaming_vae.feat_cache)
+
     def _encode_obs(self, obs):
+        # Allow client to pass precomputed Wan VAE latents (training latents/).
+        if obs.get("obs_latent") is not None:
+            lat = obs["obs_latent"]
+            if isinstance(lat, np.ndarray):
+                lat = torch.from_numpy(np.array(lat, copy=True))
+            lat = lat.to(device=self.device, dtype=self.dtype)
+            if lat.ndim == 4:  # C,F,H,W
+                lat = lat.unsqueeze(0)
+            logger.info("Using precomputed obs_latent %s (skip VAE encode)", tuple(lat.shape))
+            # Streaming VAE must still see the first frame, otherwise later KV
+            # keyframe encodes (T%4==0 continuation) crash with shape mismatch.
+            if obs.get("obs") is not None and self._streaming_vae_cache_is_cold():
+                images = obs["obs"]
+                if not isinstance(images, list):
+                    images = [images]
+                logger.info(
+                    "Warming streaming VAE with first obs frame (cache was cold after obs_latent)"
+                )
+                self._encode_obs_image_list(images[:1])
+            return lat
+
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
         if len(images) < 1:
             return None
+
+        # Cold cache + multi-frame is invalid for Wan streaming (needs first T=1,
+        # then chunks of 4). Official clients always encode the first obs alone.
+        if len(images) > 1 and self._streaming_vae_cache_is_cold():
+            logger.info(
+                "Streaming VAE cache cold with T=%d; encode as T=1 + groups of 4",
+                len(images),
+            )
+            parts = [self._encode_obs_image_list(images[:1])]
+            rest = images[1:]
+            pad = (4 - (len(rest) % 4)) % 4
+            if pad:
+                rest = list(rest) + [rest[-1]] * pad
+            for i in range(0, len(rest), 4):
+                parts.append(self._encode_obs_image_list(rest[i:i + 4]))
+            # Drop padding latent frames if we padded video frames.
+            out = torch.cat(parts, dim=2)
+            # Expected latent frames from video: 1 + len(rest_unpadded)//4
+            n_video = len(images)
+            n_latent = 1 + (n_video - 1) // 4
+            return out[:, :, :n_latent]
+
+        return self._encode_obs_image_list(images)
+
+    def _encode_obs_image_list(self, images: list):
+        """Encode a list of cam-dicts with streaming VAE → ``[1,C,F,H,W]`` on device."""
         videos = []
         for k_i, k in enumerate(self.job_config.obs_cam_keys):
             if self.env_type == 'robotwin_tshape':
@@ -347,34 +400,58 @@ class VA_Server:
                                             align_corners=False).unsqueeze(0)
             videos.append(history_video_k)
 
-        if self.env_type == 'robotwin_tshape':
-            videos_high = videos[0] / 255.0 * 2.0 - 1.0
-            videos_left_and_right = torch.cat(videos[1:],
-                                              dim=0) / 255.0 * 2.0 - 1.0
-            vae_device = next(self.streaming_vae.vae.parameters()).device
-            enc_out_high = self.streaming_vae.encode_chunk(
-                videos_high.to(vae_device).to(self.dtype))
-            enc_out_left_and_right = self.streaming_vae_half.encode_chunk(
-                videos_left_and_right.to(vae_device).to(self.dtype))
-            enc_out = torch.cat([
-                torch.cat(enc_out_left_and_right.split(1, dim=0), dim=-1),
-                enc_out_high
-            ],
-                                dim=-2)
-        else:
-            videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
-            vae_device = next(self.streaming_vae.vae.parameters()).device
-            videos_chunk = videos.to(vae_device).to(self.dtype)
-            enc_out = self.streaming_vae.encode_chunk(videos_chunk)
+        t0 = time.perf_counter()
+        moved = False
+        if self.enable_offload:
+            try:
+                if next(self.vae.parameters()).device.type == "cpu":
+                    free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                    if free_bytes > 4 * (1024**3):
+                        logger.info("Moving VAE -> %s for encode_obs", self.device)
+                        self.vae.to(self.device)
+                        moved = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("VAE GPU move skipped: %s", exc)
+        try:
+            if self.env_type == 'robotwin_tshape':
+                videos_high = videos[0] / 255.0 * 2.0 - 1.0
+                videos_left_and_right = torch.cat(videos[1:],
+                                                  dim=0) / 255.0 * 2.0 - 1.0
+                vae_device = next(self.streaming_vae.vae.parameters()).device
+                enc_out_high = self.streaming_vae.encode_chunk(
+                    videos_high.to(vae_device).to(self.dtype))
+                enc_out_left_and_right = self.streaming_vae_half.encode_chunk(
+                    videos_left_and_right.to(vae_device).to(self.dtype))
+                enc_out = torch.cat([
+                    torch.cat(enc_out_left_and_right.split(1, dim=0), dim=-1),
+                    enc_out_high
+                ],
+                                    dim=-2)
+            else:
+                videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
+                vae_device = next(self.streaming_vae.vae.parameters()).device
+                videos_chunk = videos.to(vae_device).to(self.dtype)
+                enc_out = self.streaming_vae.encode_chunk(videos_chunk)
 
-        mu, logvar = torch.chunk(enc_out, 2, dim=1)
-        latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)
-        latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
-        mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
-        video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
-        return video_latent.to(self.device)
+            mu, logvar = torch.chunk(enc_out, 2, dim=1)
+            latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)
+            latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
+            mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
+            video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
+            out = video_latent.to(self.device)
+        finally:
+            if moved:
+                self.vae.to("cpu")
+                torch.cuda.empty_cache()
+        logger.info(
+            "VAE encode_obs done in %.2fs shape=%s (T_img=%d)",
+            time.perf_counter() - t0,
+            tuple(out.shape),
+            len(images),
+        )
+        return out
 
-    def _reset(self, prompt=None):
+    def _reset(self, prompt=None, prompt_embeds=None, negative_prompt_embeds=None):
         logger.info('Reset.')
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
@@ -419,26 +496,107 @@ class VA_Server:
                                         dtype=torch.float32).reshape(-1, 1, 1)
         self.action_norm_method = self.job_config.action_norm_method
 
-        ##### get prompt
-        if prompt is None:
-            self.prompt_embeds = self.negative_prompt_embeds = None
-        else:
-            self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=None,
-                do_classifier_free_guidance=self.job_config.guidance_scale > 1,
-                num_videos_per_prompt=1,
-                prompt_embeds=None,
-                negative_prompt_embeds=None,
-                max_sequence_length=512,
-                device=self.device,
-                dtype=self.dtype,
-            )
+        ##### get prompt embeds (prefer precomputed training text_emb / empty_emb)
+        self.prompt_embeds, self.negative_prompt_embeds = self._resolve_prompt_embeds(
+            prompt=prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+        )
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
+
+    def _to_prompt_embed_tensor(self, emb) -> torch.Tensor:
+        """Accept [L,D] / [1,L,D] numpy|tensor → ``[1, L, D]`` on model device/dtype."""
+        if emb is None:
+            raise ValueError("prompt embed is None")
+        if isinstance(emb, np.ndarray):
+            emb = torch.from_numpy(np.array(emb, copy=True))
+        elif not torch.is_tensor(emb):
+            emb = torch.as_tensor(emb)
+        emb = emb.detach().contiguous().clone()
+        if emb.ndim == 2:
+            emb = emb.unsqueeze(0)
+        if emb.ndim != 3:
+            raise ValueError(f"prompt embed must be [L,D] or [B,L,D], got {tuple(emb.shape)}")
+        return emb.to(device=self.device, dtype=self.dtype)
+
+    def _resolve_prompt_embeds(
+        self,
+        prompt=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+    ):
+        need_neg = self.job_config.guidance_scale > 1
+
+        if prompt_embeds is not None:
+            logger.info("Using precomputed prompt_embeds (skip UMT5 encode).")
+            pos = self._to_prompt_embed_tensor(prompt_embeds)
+            if negative_prompt_embeds is not None:
+                neg = self._to_prompt_embed_tensor(negative_prompt_embeds)
+            elif need_neg:
+                neg = self._load_empty_emb_tensor()
+            else:
+                neg = None
+            return pos, neg
+
+        if prompt is None:
+            return None, None
+
+        # Optional: resolve from job_config.prompt_emb_path / empty_emb_path
+        prompt_emb_path = getattr(self.job_config, "prompt_emb_path", None)
+        if prompt_emb_path and os.path.isfile(prompt_emb_path):
+            logger.info("Loading prompt_embeds from %s", prompt_emb_path)
+            cached = torch.load(prompt_emb_path, map_location="cpu", weights_only=False)
+            if isinstance(cached, dict):
+                cached = cached.get("text_emb", cached.get("prompt_embeds"))
+            pos = self._to_prompt_embed_tensor(cached)
+            neg = self._load_empty_emb_tensor() if need_neg else None
+            return pos, neg
+
+        logger.info(
+            "Encoding prompt with UMT5 (slow when enable_offload puts text_encoder on CPU)..."
+        )
+        t0 = time.perf_counter()
+        pos, neg = self.encode_prompt(
+            prompt=prompt,
+            negative_prompt=None,
+            do_classifier_free_guidance=need_neg,
+            num_videos_per_prompt=1,
+            prompt_embeds=None,
+            negative_prompt_embeds=None,
+            max_sequence_length=512,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        logger.info("UMT5 prompt encode done in %.1fs", time.perf_counter() - t0)
+        return pos, neg
+
+    def _load_empty_emb_tensor(self) -> torch.Tensor:
+        empty_path = getattr(self.job_config, "empty_emb_path", None)
+        if not empty_path or not os.path.isfile(empty_path):
+            # Fall back to live encode of "" (same as training empty_emb).
+            logger.warning(
+                "empty_emb_path missing (%s); encoding empty string with UMT5",
+                empty_path,
+            )
+            neg, _ = self.encode_prompt(
+                prompt="",
+                negative_prompt=None,
+                do_classifier_free_guidance=False,
+                num_videos_per_prompt=1,
+                max_sequence_length=512,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            return neg
+        logger.info("Loading negative/empty prompt embeds from %s", empty_path)
+        emb = torch.load(empty_path, map_location="cpu", weights_only=False)
+        if isinstance(emb, dict):
+            emb = emb.get("text_emb", emb.get("empty_emb", emb))
+        return self._to_prompt_embed_tensor(emb)
 
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
@@ -486,7 +644,17 @@ class VA_Server:
                 torch.no_grad(),
         ):
             # 1. Video Generation Loop
+            n_vid = len(timesteps)
+            n_act = len(action_timesteps)
+            logger.info(
+                "Denoise start: video_steps=%d action_steps=%d cfg=%s "
+                "(first chunk is slow; progress logged each step)",
+                n_vid,
+                n_act,
+                self.use_cfg,
+            )
             for i, t in enumerate(tqdm(timesteps)):
+                step_t0 = time.perf_counter()
                 last_step = i == len(timesteps) - 1
                 latent_cond = init_latent[:, :, 0:1].to(
                     self.dtype) if frame_st_id == 0 else None
@@ -520,8 +688,15 @@ class VA_Server:
                                                   return_dict=False)
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+                logger.info(
+                    "video denoise %d/%d done in %.2fs",
+                    i + 1,
+                    n_vid,
+                    time.perf_counter() - step_t0,
+                )
 
             for i, t in enumerate(tqdm(action_timesteps)):
+                step_t0 = time.perf_counter()
                 last_step = i == len(action_timesteps) - 1
                 action_cond = torch.zeros(
                     [
@@ -559,6 +734,12 @@ class VA_Server:
                                                          return_dict=False)
 
                 actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+                logger.info(
+                    "action denoise %d/%d done in %.2fs",
+                    i + 1,
+                    n_act,
+                    time.perf_counter() - step_t0,
+                )
 
         actions[:, ~self.action_mask] *= 0
 
@@ -608,10 +789,15 @@ class VA_Server:
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        return_video = bool(obs.get('return_video', False))
 
         if reset:
             logger.info(f"******************* Reset server ******************")
-            self._reset(prompt=prompt)
+            self._reset(
+                prompt=prompt,
+                prompt_embeds=obs.get("prompt_embeds", None),
+                negative_prompt_embeds=obs.get("negative_prompt_embeds", None),
+            )
             return dict()
         elif compute_kv_cache:
             logger.info(
@@ -620,8 +806,91 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-            return dict(action=action)
+            action, latents = self._infer(obs, frame_st_id=self.frame_st_id)
+            out = dict(action=action)
+            if return_video:
+                t0 = time.perf_counter()
+                out["video"] = self._latents_to_cam_videos(latents)
+                logger.info(
+                    "Decoded pred video for client in %.1fs (cams=%s frames=%s)",
+                    time.perf_counter() - t0,
+                    list(out["video"].keys()),
+                    {k: v.shape for k, v in out["video"].items()},
+                )
+            return out
+
+    def _latents_to_cam_videos(self, latents: torch.Tensor) -> dict:
+        """Decode chunk latents → per-camera uint8 clips ``{cam_short: (F,H,W,3)}``."""
+        n_cam = len(self.job_config.obs_cam_keys)
+        moved = False
+        vae_device = next(self.vae.parameters()).device
+        if self.enable_offload and vae_device.type == "cpu":
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                # Wan2.2 VAE ~1–2GB; keep a margin for decode activations.
+                if free_bytes > 4 * (1024**3):
+                    logger.info("Temporarily moving VAE to %s for video decode", self.device)
+                    self.vae.to(self.device)
+                    moved = True
+                    vae_device = self.device
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Skip GPU VAE move for decode: %s", exc)
+
+        try:
+            video = self.decode_one_video(latents.to(vae_device), "np")
+            # Diffusers postprocess: (B, F, H, W, C) in [0, 1] float or uint8.
+            frames = video[0]
+            if frames.dtype != np.uint8:
+                frames = (np.clip(frames, 0.0, 1.0) * 255.0).astype(np.uint8)
+            frames = np.ascontiguousarray(frames)
+
+            out: dict = {}
+            if self.env_type == "robotwin_tshape":
+                # Latents are stacked along height: wrists on top, high cam below.
+                # Approximate split: last third is high, first two-thirds wrists.
+                f, h, w, c = frames.shape
+                h_wrist = (h * 2) // 3
+                wrist = frames[:, :h_wrist]
+                high = frames[:, h_wrist:]
+                # Split wrist strip into left/right if >=2 wrist cams.
+                wrist_cams = self.job_config.obs_cam_keys[1:]
+                if len(wrist_cams) >= 2:
+                    w_each = w // len(wrist_cams)
+                    for i, key in enumerate(wrist_cams):
+                        short = key.replace("observation.images.", "")
+                        out[short] = np.ascontiguousarray(
+                            wrist[:, :, i * w_each:(i + 1) * w_each]
+                        )
+                elif len(wrist_cams) == 1:
+                    short = wrist_cams[0].replace("observation.images.", "")
+                    out[short] = np.ascontiguousarray(wrist)
+                high_key = self.job_config.obs_cam_keys[0].replace(
+                    "observation.images.", ""
+                )
+                out[high_key] = np.ascontiguousarray(high)
+            else:
+                # env_type none / default: cameras concatenated along width.
+                f, h, w, c = frames.shape
+                if w % n_cam != 0:
+                    logger.warning(
+                        "Pred video width %s not divisible by n_cam=%s; "
+                        "returning single wide clip as 'pred'",
+                        w,
+                        n_cam,
+                    )
+                    out["pred"] = frames
+                else:
+                    w_each = w // n_cam
+                    for i, key in enumerate(self.job_config.obs_cam_keys):
+                        short = key.replace("observation.images.", "")
+                        out[short] = np.ascontiguousarray(
+                            frames[:, :, i * w_each:(i + 1) * w_each]
+                        )
+            return out
+        finally:
+            if moved:
+                self.vae.to("cpu")
+                torch.cuda.empty_cache()
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)
@@ -646,7 +915,6 @@ class VA_Server:
     
     @torch.no_grad()
     def generate(self):
-        self.video_processor = VideoProcessor(vae_scale_factor=1)
         self._reset(self.job_config.prompt)
         init_obs = self.load_init_obs()
         pred_latent_lst = []
