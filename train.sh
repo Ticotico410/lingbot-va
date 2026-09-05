@@ -27,10 +27,10 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 # ---------------------------------------------------------------------------
 LEARNING_RATE="${LEARNING_RATE:-}"
 NUM_STEPS="${NUM_STEPS:-}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
+BATCH_SIZE="${BATCH_SIZE:-}"
 GRAD_ACCUM="${GRAD_ACCUM:-}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-}"
-LOAD_WORKER="${LOAD_WORKER:-18}"
+LOAD_WORKER="${LOAD_WORKER:-}"
 RESUME_FROM="${RESUME_FROM:-}"
 
 # ---------------------------------------------------------------------------

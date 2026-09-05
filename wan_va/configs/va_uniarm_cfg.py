@@ -20,10 +20,13 @@ va_uniarm_cfg.width = 256
 va_uniarm_cfg.action_dim = 30
 # Existing latents: 10fps from 30Hz (stride=3) -> action_per_frame = 3*4 = 12
 va_uniarm_cfg.action_per_frame = 12
-# Truncate each train sample along latent time to fit 96GB + eager flex.
-va_uniarm_cfg.train_max_latent_frames = 16
-# Cap flex attention window used in train.py random sampling.
-va_uniarm_cfg.train_window_size_range = (4, 17)
+# Training attention backend. Official recipe uses "flex"; "flashattn" is faster
+# on this PPU but drops FlexAttention causal/window masks.
+va_uniarm_cfg.train_attn_mode = "flashattn"
+# Truncate each train sample along latent time to fit 96GB.
+va_uniarm_cfg.train_max_latent_frames = 8
+# Cap flex attention window (only used when train_attn_mode=flex).
+va_uniarm_cfg.train_window_size_range = (4, 9)
 va_uniarm_cfg.obs_cam_keys = [
     'observation.images.head',
     'observation.images.wrist',

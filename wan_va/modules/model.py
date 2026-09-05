@@ -815,14 +815,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                       condition_action_hidden_states.shape[1],
                       padded_length]
 
-        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
-                               action_dict['noisy_latents'].shape, 
-                               padded_length, 
-                               input_dict["chunk_size"],
-                               window_size=input_dict['window_size'],
-                               patch_size=self.patch_size,
-                               device=hidden_states.device
-                               )
+        # Flex masks only needed when blocks use FlexAttnFunc.
+        if getattr(self.blocks[0], "attn_mode", None) == "flex":
+            FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
+                                   action_dict['noisy_latents'].shape, 
+                                   padded_length, 
+                                   input_dict["chunk_size"],
+                                   window_size=input_dict['window_size'],
+                                   patch_size=self.patch_size,
+                                   device=hidden_states.device
+                                   )
 
         for block in self.blocks:
             hidden_states = block(hidden_states,

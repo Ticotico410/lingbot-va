@@ -17,8 +17,8 @@ va_uniarm_train_cfg.empty_emb_path = os.path.join(
 # Disable by default; set True after exporting WANDB_* in run_va_posttrain.sh
 va_uniarm_train_cfg.enable_wandb = False
 # CPU DataLoader workers (needs TMPDIR on /dev/shm; see train.sh).
-va_uniarm_train_cfg.load_worker = 18
-va_uniarm_train_cfg.save_interval = 10000
+va_uniarm_train_cfg.load_worker = 20
+va_uniarm_train_cfg.save_interval = 5000
 va_uniarm_train_cfg.gc_interval = 50
 va_uniarm_train_cfg.cfg_prob = 0.1
 
@@ -27,7 +27,7 @@ va_uniarm_train_cfg.beta1 = 0.9
 va_uniarm_train_cfg.beta2 = 0.95
 va_uniarm_train_cfg.weight_decay = 1e-1
 va_uniarm_train_cfg.warmup_steps = 10
-va_uniarm_train_cfg.batch_size = 8
+va_uniarm_train_cfg.batch_size = 1
 va_uniarm_train_cfg.gradient_accumulation_steps = 8
-va_uniarm_train_cfg.num_steps = 100000
+va_uniarm_train_cfg.num_steps = 50000
 va_uniarm_train_cfg.save_root = './train_out/uniarm_pick_key_and_controller'

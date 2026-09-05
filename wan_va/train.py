@@ -92,7 +92,7 @@ class Trainer:
             transformer_path,
             torch_dtype=torch.float32,
             torch_device='cpu',
-            attn_mode="flex"
+            attn_mode=getattr(config, "train_attn_mode", "flashattn"),
         )
 
         logger.info("Setting up activation checkpointing ...")
